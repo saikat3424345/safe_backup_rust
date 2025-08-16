@@ -1,0 +1,179 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+fn log_action(msg: &str) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("safebackup.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+fn read_line_trim(prompt: &str) -> io::Result<String> {
+    print!("{}", prompt);
+    io::Write::flush(&mut io::stdout())?;
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    Ok(s.trim().to_string())
+}
+
+fn is_symlink(p: &Path) -> io::Result<bool> {
+    Ok(fs::symlink_metadata(p)?.file_type().is_symlink())
+}
+
+fn sanitize_filename(p: &str) -> bool {
+    // Basic traversal guard. For a real app, consider allowlists & canonicalization.
+    !p.contains("..")
+}
+
+#[cfg(unix)]
+fn has_read_permission(p: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = fs::metadata(p)?;
+    let mode = md.permissions().mode();
+    Ok((mode & 0o444) != 0) // any read bit
+}
+
+#[cfg(windows)]
+fn has_read_permission(p: &Path) -> io::Result<bool> {
+    // Windows permissions are ACL-based; if metadata is retrievable, assume readable.
+    Ok(fs::metadata(p).is_ok())
+}
+
+fn validate_source_file(src: &Path) -> io::Result<()> {
+    if !sanitize_filename(&src.to_string_lossy()) {
+        eprintln!("Invalid filename (path traversal not allowed).");
+        log_action("Blocked path traversal attempt");
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"));
+    }
+    if is_symlink(src)? {
+        eprintln!("Operation blocked on symbolic links.");
+        log_action("Blocked symlink access");
+        return Err(io::Error::new(io::ErrorKind::Other, "symlink blocked"));
+    }
+    if !src.exists() {
+        eprintln!("Error: source file not found.");
+        log_action("Source file not found");
+        return Err(io::Error::new(io::ErrorKind::NotFound, "source not found"));
+    }
+    if !has_read_permission(src)? {
+        eprintln!("No read permission for source file.");
+        log_action("No read permission");
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "no read permission"));
+    }
+    Ok(())
+}
+
+fn copy_text_file(src: &Path, dest: &Path) -> io::Result<()> {
+    let in_file = File::open(src)?;
+    let mut out = File::create(dest)?;
+
+    let reader = BufReader::new(in_file);
+    for line in reader.lines() {
+        writeln!(out, "{}", line?)?;
+    }
+    Ok(())
+}
+
+fn do_backup(filename: &str) -> io::Result<()> {
+    let src = PathBuf::from(filename);
+    validate_source_file(&src)?;
+
+    let backup_name = format!("{}.bak", filename);
+    let dest = PathBuf::from(&backup_name);
+
+    if dest.exists() {
+        let resp = read_line_trim("Backup exists. Overwrite? (yes/no): ")?;
+        if resp.to_lowercase() != "yes" {
+            println!("Backup cancelled.");
+            return Ok(());
+        }
+    }
+
+    copy_text_file(&src, &dest)?;
+    println!("Backup successful.");
+    log_action("Backup completed");
+    Ok(())
+}
+
+fn do_restore(filename: &str) -> io::Result<()> {
+    let backup_name = format!("{}.bak", filename);
+    let src = PathBuf::from(&backup_name);
+    if !src.exists() {
+        eprintln!("Backup file not found.");
+        log_action("Restore failed: backup not found");
+        return Err(io::Error::new(io::ErrorKind::NotFound, "backup not found"));
+    }
+
+    if is_symlink(&src)? {
+        eprintln!("Operation blocked on symbolic links.");
+        log_action("Blocked symlink restore");
+        return Err(io::Error::new(io::ErrorKind::Other, "symlink blocked"));
+    }
+
+    let dest = PathBuf::from(filename);
+    if dest.exists() {
+        let resp = read_line_trim("Target exists. Overwrite? (yes/no): ")?;
+        if resp.to_lowercase() != "yes" {
+            println!("Restore cancelled.");
+            return Ok(());
+        }
+    }
+
+    copy_text_file(&src, &dest)?;
+    println!("Restore successful.");
+    log_action("Restore completed");
+    Ok(())
+}
+
+fn do_delete(filename: &str) -> io::Result<()> {
+    let p = PathBuf::from(filename);
+    if !p.exists() {
+        eprintln!("File not found.");
+        return Ok(());
+    }
+    if is_symlink(&p)? {
+        eprintln!("Operation blocked on symbolic links.");
+        log_action("Blocked symlink delete");
+        return Err(io::Error::new(io::ErrorKind::Other, "symlink blocked"));
+    }
+    let resp = read_line_trim("Delete file? (yes/no): ")?;
+    if resp.to_lowercase() != "yes" {
+        println!("Delete cancelled.");
+        return Ok(());
+    }
+    if let Err(e) = fs::remove_file(&p) {
+        eprintln!("File deletion failed: {}", e);
+        log_action("Delete failed");
+    } else {
+        println!("Delete successful.");
+        log_action("Delete completed");
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let command = read_line_trim("Enter command (backup/restore/delete): ")?;
+    let command = command.to_lowercase();
+    match command.as_str() {
+        "backup" | "restore" | "delete" => {}
+        _ => {
+            eprintln!("Unknown command");
+            return Ok(());
+        }
+    };
+
+    let filename = read_line_trim("Enter filename: ")?;
+
+    match command.as_str() {
+        "backup" => do_backup(&filename)?,
+        "restore" => do_restore(&filename)?,
+        "delete" => do_delete(&filename)?,
+        _ => {}
+    }
+
+    Ok(())
+}
